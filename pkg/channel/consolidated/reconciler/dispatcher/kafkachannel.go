@@ -20,6 +20,13 @@ import (
 	"context"
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/util/sets"
+
+	channel2 "knative.dev/eventing/pkg/channel"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"knative.dev/pkg/apis/duck"
+
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -27,7 +34,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/cache"
 
-	eventingduckv1 "knative.dev/eventing/pkg/apis/duck/v1"
+	v1 "knative.dev/eventing/pkg/apis/duck/v1"
 	"knative.dev/eventing/pkg/apis/eventing"
 	"knative.dev/eventing/pkg/channel/fanout"
 	"knative.dev/eventing/pkg/kncloudevents"
@@ -146,6 +153,16 @@ func filterWithAnnotation(namespaced bool) func(obj interface{}) bool {
 }
 
 func (r *Reconciler) ReconcileKind(ctx context.Context, kc *v1beta1.KafkaChannel) pkgreconciler.Event {
+	logging.FromContext(ctx).Debug("Reconciling Channel RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR")
+	return r.setupChannelsDispatching(ctx, kc)
+}
+
+//func (r *Reconciler) ObserveKind(ctx context.Context, kc *v1beta1.KafkaChannel) pkgreconciler.Event {
+//	logging.FromContext(ctx).Debug("Reconciling Channel OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO", zap.Any("ch", kc))
+//	return r.setupChannelsDispatching(ctx)
+//}
+
+func (r *Reconciler) setupChannelsDispatching(ctx context.Context, kc *v1beta1.KafkaChannel) pkgreconciler.Event {
 	channels, err := r.kafkachannelLister.List(labels.Everything())
 	if err != nil {
 		logging.FromContext(ctx).Error("Error listing kafka channels")
@@ -161,6 +178,8 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, kc *v1beta1.KafkaChannel
 			kafkaChannels = append(kafkaChannels, channel)
 		}
 	}
+	r.setupSubscriptionStatusWatcher(ctx, kc)
+
 	config := r.newConfigFromKafkaChannels(kafkaChannels)
 	if err := r.kafkaDispatcher.UpdateHostToChannelMap(config); err != nil {
 		logging.FromContext(ctx).Error("Error updating host to channel map in dispatcher")
@@ -172,7 +191,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, kc *v1beta1.KafkaChannel
 		logging.FromContext(ctx).Error("Error updating kafka consumers in dispatcher")
 		return err
 	}
-	kc.Status.SubscribableStatus = r.createSubscribableStatus(&kc.Spec.SubscribableSpec, failedSubscriptions)
+	//kc.Status.SubscribableStatus = r.createSubscribableStatus(&kc.Spec.SubscribableSpec, failedSubscriptions)
 	if len(failedSubscriptions) > 0 {
 		logging.FromContext(ctx).Error("Some kafka subscriptions failed to subscribe")
 		return fmt.Errorf("Some kafka subscriptions failed to subscribe")
@@ -180,26 +199,57 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, kc *v1beta1.KafkaChannel
 	return nil
 }
 
-func (r *Reconciler) createSubscribableStatus(subscribable *eventingduckv1.SubscribableSpec, failedSubscriptions map[types.UID]error) eventingduckv1.SubscribableStatus {
-	if subscribable == nil {
-		return eventingduckv1.SubscribableStatus{}
+func (r *Reconciler) setupSubscriptionStatusWatcher(ctx context.Context, channel *v1beta1.KafkaChannel) error {
+
+	ch := channel2.ChannelReference{
+		channel.Namespace,
+		channel.Name,
 	}
-	subscriberStatus := make([]eventingduckv1.SubscriberStatus, 0)
-	for _, sub := range subscribable.Subscribers {
-		status := eventingduckv1.SubscriberStatus{
-			UID:                sub.UID,
-			ObservedGeneration: sub.Generation,
-			Ready:              corev1.ConditionTrue,
+	r.kafkaDispatcher.Watch(ch, func() {
+		err := r.markSubscriptionReadiness(ctx, channel, r.kafkaDispatcher.GetReadySubscriptions(ch))
+		if err != nil {
+			logging.FromContext(ctx).Errorw("error updating subscription readiness", zap.Error(err))
 		}
-		if err, ok := failedSubscriptions[sub.UID]; ok {
-			status.Ready = corev1.ConditionFalse
-			status.Message = err.Error()
+	})
+	return nil
+}
+
+func (r *Reconciler) markSubscriptionReadiness(ctx context.Context, ch *v1beta1.KafkaChannel, subs sets.String) error {
+	logging.FromContext(ctx).Debugw("marking subscriptions", zap.Any("subs", subs.List()))
+	after := ch.DeepCopy()
+	after.Status.Subscribers = make([]v1.SubscriberStatus, 0)
+
+	for _, s := range ch.Spec.Subscribers {
+		if subs.Has(string(s.UID)) {
+			logging.FromContext(ctx).Debugw("marking subscription", zap.Any("subscription", s))
+			after.Status.Subscribers = append(after.Status.Subscribers, v1.SubscriberStatus{
+				UID:                s.UID,
+				ObservedGeneration: s.Generation,
+				Ready:              corev1.ConditionTrue,
+			})
 		}
-		subscriberStatus = append(subscriberStatus, status)
 	}
-	return eventingduckv1.SubscribableStatus{
-		Subscribers: subscriberStatus,
+
+	jsonPatch, err := duck.CreatePatch(ch, after)
+	if err != nil {
+		return fmt.Errorf("creating JSON patch: %w", err)
 	}
+	// If there is nothing to patch, we are good, just return.
+	// Empty patch is [], hence we check for that.
+	if len(jsonPatch) == 0 {
+		return nil
+	}
+	patch, err := jsonPatch.MarshalJSON()
+	if err != nil {
+		return fmt.Errorf("marshaling JSON patch: %w", err)
+	}
+	patched, err := r.kafkaClientSet.MessagingV1beta1().KafkaChannels(ch.Namespace).Patch(ctx, ch.Name, types.JSONPatchType, patch, metav1.PatchOptions{}, "status")
+
+	if err != nil {
+		return fmt.Errorf("Failed patching: %w", err)
+	}
+	logging.FromContext(ctx).Debugw("Patched resource", zap.Any("patch", patch), zap.Any("patched", patched))
+	return nil
 }
 
 // newConfigFromKafkaChannels creates a new Config from the list of kafka channels.

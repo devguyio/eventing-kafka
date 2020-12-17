@@ -29,6 +29,7 @@ type KafkaConsumerHandler interface {
 	// When this function returns true, the consumer group offset is marked as consumed.
 	// The returned error is enqueued in errors channel.
 	Handle(context context.Context, message *sarama.ConsumerMessage) (bool, error)
+	SetReady(ready bool)
 }
 
 // ConsumerHandler implements sarama.ConsumerGroupHandler and provides some glue code to simplify message handling
@@ -52,7 +53,9 @@ func NewConsumerHandler(logger *zap.SugaredLogger, handler KafkaConsumerHandler)
 }
 
 // Setup is run at the beginning of a new session, before ConsumeClaim
-func (consumer *SaramaConsumerHandler) Setup(sarama.ConsumerGroupSession) error {
+func (consumer *SaramaConsumerHandler) Setup(session sarama.ConsumerGroupSession) error {
+	consumer.logger.Infow("Consumer is ready", zap.Any("session", session))
+	//consumer.handler.SetReady(true)
 	return nil
 }
 
@@ -61,12 +64,14 @@ func (consumer *SaramaConsumerHandler) Cleanup(session sarama.ConsumerGroupSessi
 	consumer.closeErrors.Do(func() {
 		close(consumer.errors)
 	})
+	consumer.handler.SetReady(false)
 	return nil
 }
 
 // ConsumeClaim must start a consumer loop of ConsumerGroupClaim's Messages().
 func (consumer *SaramaConsumerHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	consumer.logger.Info(fmt.Sprintf("Starting partition consumer, topic: %s, partition: %d, initialOffset: %d", claim.Topic(), claim.Partition(), claim.InitialOffset()))
+	consumer.handler.SetReady(true)
 
 	// NOTE:
 	// Do not move the code below to a goroutine.

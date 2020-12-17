@@ -24,6 +24,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	"knative.dev/eventing-kafka/pkg/source"
 
 	"knative.dev/eventing-kafka/pkg/common/tracing"
@@ -44,20 +46,30 @@ import (
 	"knative.dev/pkg/kmeta"
 )
 
+type ConsumerCallback func()
+
 type KafkaDispatcher struct {
 	hostToChannelMap atomic.Value
+
 	// hostToChannelMapLock is used to update hostToChannelMap
 	hostToChannelMapLock sync.Mutex
+	// consumerUpdateLock is used to update kafkaConsumers
+	consumerUpdateLock sync.Mutex
+	// readySubscriptionsLock must be used to synchronize access to channelReadySubscriptions
+	readySubscriptionsLock sync.RWMutex
+	// watchersLock must be used to synchronize access to consumerWatchers
+	watchersLock sync.RWMutex
 
 	receiver   *eventingchannels.MessageReceiver
 	dispatcher *eventingchannels.MessageDispatcherImpl
 
-	kafkaSyncProducer    sarama.SyncProducer
-	channelSubscriptions map[eventingchannels.ChannelReference][]types.UID
-	subsConsumerGroups   map[types.UID]sarama.ConsumerGroup
-	subscriptions        map[types.UID]Subscription
-	// consumerUpdateLock must be used to update kafkaConsumers
-	consumerUpdateLock   sync.Mutex
+	kafkaSyncProducer         sarama.SyncProducer
+	channelSubscriptions      map[eventingchannels.ChannelReference][]types.UID
+	channelReadySubscriptions map[eventingchannels.ChannelReference]sets.String
+	subsConsumerGroups        map[types.UID]sarama.ConsumerGroup
+	subscriptions             map[types.UID]Subscription
+	consumerWatchers          map[eventingchannels.ChannelReference][]ConsumerCallback
+
 	kafkaConsumerFactory consumer.KafkaConsumerGroupFactory
 
 	topicFunc TopicFunc
@@ -107,14 +119,16 @@ func NewDispatcher(ctx context.Context, args *KafkaDispatcherArgs) (*KafkaDispat
 	}
 
 	dispatcher := &KafkaDispatcher{
-		dispatcher:           eventingchannels.NewMessageDispatcher(args.Logger.Desugar()),
-		kafkaConsumerFactory: consumer.NewConsumerGroupFactory(args.Brokers, conf),
-		channelSubscriptions: make(map[eventingchannels.ChannelReference][]types.UID),
-		subsConsumerGroups:   make(map[types.UID]sarama.ConsumerGroup),
-		subscriptions:        make(map[types.UID]Subscription),
-		kafkaSyncProducer:    producer,
-		logger:               args.Logger,
-		topicFunc:            args.TopicFunc,
+		dispatcher:                eventingchannels.NewMessageDispatcher(args.Logger.Desugar()),
+		kafkaConsumerFactory:      consumer.NewConsumerGroupFactory(args.Brokers, conf),
+		channelSubscriptions:      make(map[eventingchannels.ChannelReference][]types.UID),
+		subsConsumerGroups:        make(map[types.UID]sarama.ConsumerGroup),
+		subscriptions:             make(map[types.UID]Subscription),
+		channelReadySubscriptions: make(map[eventingchannels.ChannelReference]sets.String),
+		consumerWatchers:          make(map[eventingchannels.ChannelReference][]ConsumerCallback),
+		kafkaSyncProducer:         producer,
+		logger:                    args.Logger,
+		topicFunc:                 args.TopicFunc,
 	}
 
 	podName, err := env.GetRequiredConfigValue(args.Logger.Desugar(), env.PodNameEnvVarKey)
@@ -174,9 +188,15 @@ type KafkaDispatcherArgs struct {
 }
 
 type consumerMessageHandler struct {
-	logger     *zap.SugaredLogger
-	sub        Subscription
-	dispatcher *eventingchannels.MessageDispatcherImpl
+	logger          *zap.SugaredLogger
+	sub             Subscription
+	dispatcher      *eventingchannels.MessageDispatcherImpl
+	kafkaDispatcher *KafkaDispatcher
+	channelRef      eventingchannels.ChannelReference
+}
+
+func (c consumerMessageHandler) SetReady(ready bool) {
+	c.kafkaDispatcher.setReady(c.channelRef, c.sub, ready)
 }
 
 func (c consumerMessageHandler) Handle(ctx context.Context, consumerMessage *sarama.ConsumerMessage) (bool, error) {
@@ -227,6 +247,54 @@ type ChannelConfig struct {
 	Name          string
 	HostName      string
 	Subscriptions []Subscription
+}
+
+func (d *KafkaDispatcher) setReady(chanRef eventingchannels.ChannelReference, sub Subscription, ready bool) {
+	d.logger.Debugw("Subscription readiness changed", zap.Any("Subscription", sub), zap.Bool("ready", ready))
+	d.readySubscriptionsLock.Lock()
+	var notify bool
+	subUID := string(sub.UID)
+	if ready {
+		readySubs, ok := d.channelReadySubscriptions[chanRef]
+		if !ok {
+			readySubs = sets.String{}
+			d.channelReadySubscriptions[chanRef] = readySubs
+		}
+		d.logger.Debugw("Checking if we have the subscription ready")
+		if !readySubs.Has(subUID) {
+			notify = true
+			readySubs.Insert(subUID)
+			d.logger.Debugw("Added subscription")
+		}
+	} else {
+		oldSubs, ok := d.channelReadySubscriptions[chanRef]
+		if ok {
+			if oldSubs.Has(subUID) {
+				oldSubs.Delete(subUID)
+				notify = true
+				d.logger.Debugw("Removing ready subscription")
+			}
+		}
+	}
+	d.readySubscriptionsLock.Unlock()
+	if notify {
+		d.logger.Debugw("Changes found, notifying")
+		d.notifyWatchers(chanRef)
+	}
+}
+
+func (d *KafkaDispatcher) notifyWatchers(chanRef eventingchannels.ChannelReference) {
+	d.readySubscriptionsLock.RLock()
+	defer d.readySubscriptionsLock.RUnlock()
+	watchers, ok := d.consumerWatchers[chanRef]
+	d.logger.Debugw("Notifying")
+	if ok {
+		d.logger.Debugw("Notifying, found")
+		for _, cb := range watchers {
+			d.logger.Debugw("Notifying callback")
+			cb()
+		}
+	}
 }
 
 // UpdateKafkaConsumers will be called by new CRD based kafka channel dispatcher controller.
@@ -308,6 +376,25 @@ func (d *KafkaDispatcher) UpdateHostToChannelMap(config *Config) error {
 	return nil
 }
 
+func (d *KafkaDispatcher) Watch(channel eventingchannels.ChannelReference, callback ConsumerCallback) {
+	d.logger.Debugw("Watching channel", zap.String("channel", channel.Name))
+	d.watchersLock.Lock()
+	defer d.watchersLock.Unlock()
+	_, ok := d.consumerWatchers[channel]
+	if !ok {
+		d.consumerWatchers[channel] = make([]ConsumerCallback, 0, 1)
+	}
+	d.consumerWatchers[channel] = append(d.consumerWatchers[channel], callback)
+	//let's call it already if we've some ready consumers
+	if len(d.channelReadySubscriptions[channel]) > 0 {
+		callback()
+	}
+}
+
+func (d *KafkaDispatcher) GetReadySubscriptions(channel eventingchannels.ChannelReference) sets.String {
+	return d.channelReadySubscriptions[channel]
+}
+
 func createHostToChannelMap(config *Config) (map[string]eventingchannels.ChannelReference, error) {
 	hcMap := make(map[string]eventingchannels.ChannelReference, len(config.ChannelConfigs))
 	for _, cConfig := range config.ChannelConfigs {
@@ -337,18 +424,24 @@ func (d *KafkaDispatcher) Start(ctx context.Context) error {
 // subscribe reads kafkaConsumers which gets updated in UpdateConfig in a separate go-routine.
 // subscribe must be called under updateLock.
 func (d *KafkaDispatcher) subscribe(channelRef eventingchannels.ChannelReference, sub Subscription) error {
-	d.logger.Info("Subscribing", zap.Any("channelRef", channelRef), zap.Any("subscription", sub.UID))
+	d.logger.Debugw("Subscribing", zap.Any("channelRef", channelRef), zap.Any("subscription", sub.UID))
 
 	topicName := d.topicFunc(utils.KafkaChannelSeparator, channelRef.Namespace, channelRef.Name)
 	groupID := fmt.Sprintf("kafka.%s.%s.%s", channelRef.Namespace, channelRef.Name, string(sub.UID))
 
-	handler := &consumerMessageHandler{d.logger, sub, d.dispatcher}
+	handler := &consumerMessageHandler{
+		d.logger,
+		sub,
+		d.dispatcher,
+		d,
+		channelRef,
+	}
 
 	consumerGroup, err := d.kafkaConsumerFactory.StartConsumerGroup(groupID, []string{topicName}, d.logger, handler)
 
 	if err != nil {
 		// we can not create a consumer - logging that, with reason
-		d.logger.Infow("Could not create proper consumer", zap.Error(err))
+		d.logger.Errorw("Could not create proper consumer", zap.Error(err))
 		return err
 	}
 
@@ -356,7 +449,7 @@ func (d *KafkaDispatcher) subscribe(channelRef eventingchannels.ChannelReference
 	// this goroutine logs errors incoming
 	go func() {
 		for err = range consumerGroup.Errors() {
-			d.logger.Warnw("Error in consumer group", zap.Error(err))
+			d.logger.Errorw("Error in consumer group", zap.Error(err))
 		}
 	}()
 
